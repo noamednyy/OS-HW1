@@ -511,7 +511,7 @@ yield(void)
 
 
 // Direct context switch from one cooperating process to another.
-// Locking policy is decided by the caller (sys_co_yield).
+// Locking policy is decided by sys_co_yield.
 void
 co_handoff(struct proc *from, struct proc *to)
 {
@@ -521,6 +521,8 @@ co_handoff(struct proc *from, struct proc *to)
   swtch(&from->context, &to->context);
   c->proc = from;
 }
+
+
 // A fork child's very first scheduling by scheduler()
 // will swtch to forkret.
 void
