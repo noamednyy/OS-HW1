@@ -97,7 +97,6 @@ co_chan(int pid)
 {
   return (void*)(uint64)pid;
 }
-
 uint64
 sys_co_yield(void)
 {
@@ -129,29 +128,32 @@ sys_co_yield(void)
   }
 
   /*
-   * Final version design:
+   * Direct handoff implementation for the assignment.
    *
-   * 1. If the target is already sleeping and waiting for co_yield on its
-   *    own rendezvous channel, we perform a direct process-to-process
-   *    handoff using swtch(), bypassing the normal scheduler.
+   * Design choices:
+   * - This implementation is intended for the required single-CPU setup.
+   * - It supports the assignment's cooperative coroutine scenario, where
+   *   two processes repeatedly yield to each other.
+   * - If the target process is already blocked waiting for co_yield on its
+   *   rendezvous channel, we pass the value directly and switch to it with
+   *   swtch(), bypassing the regular scheduler.
+   * - Otherwise, we use a fallback path in which the current process sleeps
+   *   until another cooperating process yields to it.
    *
-   * 2. Otherwise, we fall back to the simple version:
-   *    the current process sleeps until some cooperating process yields to it.
+   * Deliberate limitation:
+   * We do not attempt to fully resolve every possible race involving several
+   * unrelated processes trying to yield to the same target concurrently.
+   * This keeps the implementation compatible with the assignment's
+   * restrictions: no new process fields, no new process states, and no new
+   * global kernel data structures.
    *
-   * Important simplification / documented limitation:
-   * This implementation is intentionally designed only for the assignment's
-   * single-CPU setting and for cooperative pairs of processes. We do not try
-   * to fully support all races involving multiple unrelated processes yielding
-   * to the same target at the same time.
-   *
-   * Also, on the direct-handoff path we update the current process state
-   * without holding p->lock. This is a deliberate simplification that relies on:
-   *   - CPUS := 1
-   *   - immediate direct swtch() to the target
-   *   - no added per-process/global bookkeeping allowed by the assignment
-   *
-   * This keeps the mechanism simple and sufficient for the provided tests
-   * without changing xv6's process model or adding new kernel fields.
+   * Locking note:
+   * The direct switch is done only when the target is already sleeping in
+   * sleep(chan, &wait_lock). In that case, the target expects to resume with
+   * target->lock still held, exactly as if it had been resumed by the normal
+   * scheduler. Symmetrically, the current process switches out while holding
+   * p->lock, and when another process later yields back to it, it resumes
+   * with p->lock held and releases it before returning to userspace.
    */
 
   if(target->state == SLEEPING && target->chan == co_chan(target->pid)){
@@ -165,32 +167,39 @@ sys_co_yield(void)
       return -1;
     }
 
-    // Deliver the value that should become the target's co_yield() return value.
-    target->trapframe->a0 = value;
-    target->chan = 0;
-    target->state = RUNNING;
-
-    // Mark current process as waiting for a future opposite yield.
+    // Current process will now wait for the opposite yield.
+    acquire(&p->lock);
     p->chan = co_chan(p->pid);
     p->state = SLEEPING;
 
-    // The resumed target may have been sleeping in sleep(..., &wait_lock),
-    // so wait_lock must not be held across the direct switch.
+    // Deliver the value to the target.
+    // Important: do NOT clear target->chan here.
+    // The target will clear it itself when it continues after sleep().
+    target->trapframe->a0 = value;
+    target->state = RUNNING;
+
     release(&wait_lock);
 
-    // Direct handoff: switch straight to target, bypassing scheduler.
-    // Convention in this implementation: the resumed process returns here
-    // later with its own p->lock held by the yielding partner, so we release
-    // it before returning to userspace.
+    // Switch directly from p to target.
     co_handoff(p, target);
 
+    // We resume here when another process yields back to us,
+    // or if the scheduler runs us again after a wakeup/kill.
     p->chan = 0;
     release(&p->lock);
+
+    if(p->killed)
+      return -1;
+
     return p->trapframe->a0;
   }
 
   // Fallback path: target is not ready yet, so sleep until somebody yields to us.
   sleep(co_chan(p->pid), &wait_lock);
   release(&wait_lock);
+
+  if(p->killed)
+    return -1;
+
   return p->trapframe->a0;
 }

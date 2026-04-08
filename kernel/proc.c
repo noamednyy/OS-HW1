@@ -516,8 +516,10 @@ co_handoff(struct proc *from, struct proc *to)
 {
   struct cpu *c = mycpu();
 
+  if(!holding(&from->lock))
+    panic("co_handoff: from lock");
   if(!holding(&to->lock))
-    panic("co_handoff: target lock");
+    panic("co_handoff: to lock");
 
   c->proc = to;
   swtch(&from->context, &to->context);
