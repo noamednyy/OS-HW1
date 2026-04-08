@@ -507,25 +507,20 @@ yield(void)
   p->state = RUNNABLE;
   sched();
   release(&p->lock);
-
 }
 
-// Context switch from one coroutine to another.
+
+// Direct context switch from one cooperating process to another.
+// Locking policy is decided by the caller (sys_co_yield).
 void
 co_handoff(struct proc *from, struct proc *to)
 {
   struct cpu *c = mycpu();
 
-  if(!holding(&from->lock))
-    panic("co_handoff: from lock");
-  if(!holding(&to->lock))
-    panic("co_handoff: to lock");
-
   c->proc = to;
   swtch(&from->context, &to->context);
   c->proc = from;
 }
-
 // A fork child's very first scheduling by scheduler()
 // will swtch to forkret.
 void
