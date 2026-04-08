@@ -95,6 +95,12 @@ sys_write(void)
 }
 
 uint64
+sys_memsize(void)
+{
+  return myproc()->sz;
+}
+
+uint64
 sys_close(void)
 {
   int fd;

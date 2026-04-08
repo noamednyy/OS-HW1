@@ -507,6 +507,21 @@ yield(void)
   p->state = RUNNABLE;
   sched();
   release(&p->lock);
+
+}
+
+// Context switch from one coroutine to another.
+void
+co_handoff(struct proc *from, struct proc *to)
+{
+  struct cpu *c = mycpu();
+
+  if(!holding(&to->lock))
+    panic("co_handoff: target lock");
+
+  c->proc = to;
+  swtch(&from->context, &to->context);
+  c->proc = from;
 }
 
 // A fork child's very first scheduling by scheduler()
