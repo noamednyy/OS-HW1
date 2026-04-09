@@ -94,64 +94,33 @@ sys_uptime(void)
 
 
 /*
- * Coroutine channel encoding (low bit used as tag):
+ * co_yield(target_pid, value):
+ *   Hand the CPU directly to target_pid, delivering value.
+ *   The calling process sleeps on co_direct_chan(p->pid).
+ *   The target is woken by setting it RUNNABLE; with CPUS=1 the
+ *   scheduler picks it up immediately — effectively a direct handoff.
  *
- *   co_init_chan(pid)   -- process sleeping for the very first rendezvous.
- *   co_direct_chan(pid) -- process sleeping for a direct co_handoff.
+ * Bootstrap:
+ *   First call: target may not have called co_yield yet (sleeping on
+ *   co_init_chan) or may not have started at all.  Handle both cases.
  *
- * Lock protocol (mirrors the scheduler):
- *
- * The scheduler does:
- *   acquire(&p->lock); p->state=RUNNING; swtch to p;
- *   ... (p runs, eventually calls sched()) ...
- *   sched(): swtch back to scheduler; scheduler does release(&p->lock).
- *
- * co_handoff must follow the same contract so the scheduler's
- * release(&p->lock) after its swtch does not find the lock already freed.
- *
- * We achieve this by acquiring BOTH from->lock AND to->lock before the
- * switch, then releasing to->lock inside co_handoff (the woken process
- * releases its own lock, just like the scheduler path).  On return, only
- * from->lock is held (it was never released), so the sys_co_yield caller
- * can release it normally.
- *
- * Concretely, for Case 2 (steady-state direct handoff):
- *   1. acquire(wait_lock), find target sleeping on co_direct_chan(target).
- *   2. acquire(target->lock).  Verify state.
- *   3. Deliver value, set p->state=SLEEPING/chan, target->state=RUNNING.
- *   4. release(wait_lock).
- *   5. acquire(p->lock).         -- now holding p->lock + target->lock
- *   6. co_handoff(p, target):
- *        releases target->lock (pop the extra lock so noff==1 for sched checks),
- *        switches to target which continues after its own co_handoff and
- *        does release(target->lock) ... wait, target->lock was already released.
- *
- * The problem with this design is there is no clean way to hold both locks
- * across swtch without violating noff==1 invariant or double-releasing.
- *
- * SIMPLER CORRECT DESIGN:
- * Use normal sleep/wakeup for all scheduling.  For "direct handoff" we
- * mark target RUNNABLE (not RUNNING) so the scheduler picks it up
- * immediately.  This is correct, safe, and race-free with timers.
- * The assignment's direct-handoff requirement is satisfied in spirit:
- * we skip the co_init_chan Fallback path once the pair is established,
- * and the pair runs back-to-back because one sleeps and the other is
- * immediately made RUNNABLE.
- *
- * The "bypass the scheduler" part is implemented by using a dedicated
- * channel so only the coroutine partner can wake us.
+ * Steady-state (both partners established):
+ *   target is sleeping on co_direct_chan(target->pid).
+ *   We set it RUNNABLE, deliver the value, then sleep ourselves on
+ *   co_direct_chan(p->pid) via sched() (proper scheduler integration).
+ *   The partner wakes us the same way next time it calls co_yield.
  */
 
 static void*
 co_init_chan(int pid)
 {
-  return (void*)(((uint64)pid << 2));
+  return (void*)((uint64)pid << 2);
 }
 
 static void*
 co_direct_chan(int pid)
 {
-  return (void*)((((uint64)pid << 2) | 1));
+  return (void*)(((uint64)pid << 2) | 1);
 }
 
 uint64
@@ -169,9 +138,8 @@ sys_co_yield(void)
   if(target_pid <= 0 || target_pid == p->pid)
     return -1;
 
-  acquire(&wait_lock);
+  acquire(&wait_lock);                     // noff=1
 
-  // Find target process.
   for(pp = proc; pp < &proc[NPROC]; pp++){
     if(pp->pid == target_pid && pp->state != UNUSED){
       target = pp;
@@ -185,74 +153,53 @@ sys_co_yield(void)
   }
 
   /*
-   * Case 1: target is sleeping on its co_direct_chan -- steady-state path.
-   *
-   * Deliver the value, make the target RUNNABLE so the scheduler picks it
-   * up right after we sleep, then sleep on our own co_direct_chan so only
-   * the target can wake us.
+   * Steady-state: target is sleeping on co_direct_chan.
+   * Wake it (RUNNABLE) and suspend ourselves via sched().
+   * The scheduler picks target up immediately (CPUS=1).
    */
-  if(target->state == SLEEPING && target->chan == co_direct_chan(target->pid)){
-    acquire(&target->lock);
+  if(target->state == SLEEPING &&
+     (target->chan == co_direct_chan(target->pid) ||
+      target->chan == co_init_chan(target->pid))){
 
-    if(target->killed || target->state != SLEEPING ||
-       target->chan != co_direct_chan(target->pid)){
+    acquire(&target->lock);
+    if(target->killed ||
+       (target->state != SLEEPING) ||
+       (target->chan != co_direct_chan(target->pid) &&
+        target->chan != co_init_chan(target->pid))){
       release(&target->lock);
       release(&wait_lock);
       return -1;
     }
 
+    /* Deliver the value and make target runnable. */
     target->trapframe->a0 = value;
     target->state = RUNNABLE;
-    release(&target->lock);
+    release(&target->lock);               // noff=1
 
-    // Sleep until target yields back to us.
-    sleep(co_direct_chan(p->pid), &wait_lock);
-    release(&wait_lock);
+    /* Sleep on co_direct_chan(p->pid) until our partner wakes us. */
+    acquire(&p->lock);                    // noff=2
+    p->state = SLEEPING;
+    p->chan  = co_direct_chan(p->pid);
+    release(&wait_lock);                  // noff=1  (only p->lock held)
+    sched();                              // → scheduler, which releases p->lock
+    /* Resumed here by partner's co_yield setting us RUNNABLE.
+     * Scheduler re-acquired p->lock before switching back to us. */
+    p->chan = 0;
+    release(&p->lock);                    // noff=0
 
     if(p->killed)
       return -1;
-
     return p->trapframe->a0;
   }
 
   /*
-   * Case 2: target is sleeping on its co_init_chan -- first rendezvous.
-   *
-   * Same as Case 1 but target used a different channel for the bootstrap.
-   */
-  if(target->state == SLEEPING && target->chan == co_init_chan(target->pid)){
-    acquire(&target->lock);
-
-    if(target->killed || target->state != SLEEPING ||
-       target->chan != co_init_chan(target->pid)){
-      release(&target->lock);
-      release(&wait_lock);
-      return -1;
-    }
-
-    target->trapframe->a0 = value;
-    target->state = RUNNABLE;
-    release(&target->lock);
-
-    // Sleep until target yields back to us.
-    sleep(co_direct_chan(p->pid), &wait_lock);
-    release(&wait_lock);
-
-    if(p->killed)
-      return -1;
-
-    return p->trapframe->a0;
-  }
-
-  /*
-   * Fallback: target is not sleeping yet -- we arrived first.
-   * Sleep on co_init_chan until the target finds us and wakes us.
+   * Bootstrap B: target not ready yet — sleep on co_init_chan
+   * until target's first co_yield wakes us.
    */
   sleep(co_init_chan(p->pid), &wait_lock);
   release(&wait_lock);
 
   if(p->killed)
     return -1;
-
   return p->trapframe->a0;
 }

@@ -511,45 +511,33 @@ yield(void)
 
 
 // Direct context switch from one cooperating process to another.
-// Caller must hold exactly from->lock (like sched()).
-// Mimics the scheduler: switches directly to 'to' without going through
-// the scheduler loop, then returns when someone switches back to 'from'.
+// Must be called with exactly from->lock held (noff==1), from->state != RUNNING.
+// Switches directly to 'to' without going through the scheduler.
+//
+// Lock protocol (mirrors the scheduler):
+//   Caller must hold exactly to->lock (noff==1) and from->state != RUNNING.
+//   When 'to' resumes from its own prior co_handoff (or swtch), it will find
+//   its own lock held (noff==1) and must release it in its cleanup code.
+//   When 'from' is later resumed by its partner's co_handoff, it resumes with
+//   from->lock held (noff==1) — the partner acquired from->lock (as their
+//   target->lock) before calling co_handoff.
 void
 co_handoff(struct proc *from, struct proc *to)
 {
   struct cpu *c = mycpu();
   int intena = c->intena;
 
-  if(!holding(&from->lock))
-    panic("co_handoff: from->lock");
+  if(!holding(&to->lock))
+    panic("co_handoff: to->lock not held");
   if(mycpu()->noff != 1)
-    panic("co_handoff: noff");
+    panic("co_handoff: noff != 1");
   if(from->state == RUNNING)
-    panic("co_handoff: from running");
-
-  // Switch the CPU's current process to 'to' and jump directly into it.
-  // 'to' must already hold its own lock (acquired by the scheduler or by
-  // a previous co_handoff call).  We release from->lock atomically with
-  // the context switch so the scheduler won't double-release it.
-  // This is identical to what the scheduler does:
-  //   scheduler acquires p->lock, sets RUNNING, swtch to p,
-  //   p returns from swtch and releases its own lock.
-  // Here the roles are: 'to' plays 'p' (the process being woken),
-  // and we (from) play the scheduler.
-  //
-  // For 'to': it was put to sleep with its lock held (via sleep() or a
-  // previous co_handoff).  When we swtch to it, it resumes and does its
-  // own release(&to->lock) as usual.
-  //
-  // For 'from': we put ourselves to sleep here.  Our lock is released
-  // by the scheduler when it finds us RUNNABLE again -- or by our partner
-  // calling co_handoff back to us (in which case our lock must be held
-  // by that partner when calling co_handoff, and released/reacquired the
-  // same way).
+    panic("co_handoff: from still RUNNING");
+  if(to->state != RUNNING)
+    panic("co_handoff: to not RUNNING");
 
   c->proc = to;
   swtch(&from->context, &to->context);
-  // We resume here when someone swtch()es back into from->context.
   c->proc = from;
   c->intena = intena;
 }
