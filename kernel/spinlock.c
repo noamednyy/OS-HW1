@@ -46,8 +46,10 @@ acquire(struct spinlock *lk)
 void
 release(struct spinlock *lk)
 {
-  if(!holding(lk))
+  if(!holding(lk)) {
+    printf("panic release: %s\n", lk->name);
     panic("release");
+  }
 
   lk->cpu = 0;
 

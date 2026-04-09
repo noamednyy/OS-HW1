@@ -464,7 +464,12 @@ scheduler(void)
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
+        // In case of a direct process switch, the returning process might differ from p.
+        // The actual returning process is c->proc.
+        struct proc *rp = c->proc;
         c->proc = 0;
+        release(&rp->lock);
+        continue;
       }
       release(&p->lock);
     }
