@@ -511,17 +511,48 @@ yield(void)
 
 
 // Direct context switch from one cooperating process to another.
-// Locking policy is decided by sys_co_yield.
+// Caller must hold exactly from->lock (like sched()).
+// Mimics the scheduler: switches directly to 'to' without going through
+// the scheduler loop, then returns when someone switches back to 'from'.
 void
 co_handoff(struct proc *from, struct proc *to)
 {
   struct cpu *c = mycpu();
+  int intena = c->intena;
+
+  if(!holding(&from->lock))
+    panic("co_handoff: from->lock");
+  if(mycpu()->noff != 1)
+    panic("co_handoff: noff");
+  if(from->state == RUNNING)
+    panic("co_handoff: from running");
+
+  // Switch the CPU's current process to 'to' and jump directly into it.
+  // 'to' must already hold its own lock (acquired by the scheduler or by
+  // a previous co_handoff call).  We release from->lock atomically with
+  // the context switch so the scheduler won't double-release it.
+  // This is identical to what the scheduler does:
+  //   scheduler acquires p->lock, sets RUNNING, swtch to p,
+  //   p returns from swtch and releases its own lock.
+  // Here the roles are: 'to' plays 'p' (the process being woken),
+  // and we (from) play the scheduler.
+  //
+  // For 'to': it was put to sleep with its lock held (via sleep() or a
+  // previous co_handoff).  When we swtch to it, it resumes and does its
+  // own release(&to->lock) as usual.
+  //
+  // For 'from': we put ourselves to sleep here.  Our lock is released
+  // by the scheduler when it finds us RUNNABLE again -- or by our partner
+  // calling co_handoff back to us (in which case our lock must be held
+  // by that partner when calling co_handoff, and released/reacquired the
+  // same way).
 
   c->proc = to;
   swtch(&from->context, &to->context);
+  // We resume here when someone swtch()es back into from->context.
   c->proc = from;
+  c->intena = intena;
 }
-
 
 // A fork child's very first scheduling by scheduler()
 // will swtch to forkret.

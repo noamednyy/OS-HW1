@@ -1,0 +1,16 @@
+#!/usr/bin/expect -f
+set timeout 60
+spawn make qemu
+expect "$ "
+send "co_test\r"
+expect {
+    "panic" {
+        puts "\n=== PANIC DETECTED ==="
+        sleep 1
+        expect -re ".*" { puts $expect_out(buffer) }
+    }
+    timeout { puts "\n=== OK: no panic in 60s ===" }
+}
+sleep 2
+send "\x01x"
+expect eof

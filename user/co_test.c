@@ -16,6 +16,6 @@ main(void)
     for (;;) {
     int value = co_yield(pid2, 2);
     printf("parent received: %d\n", value); // Should print 1
-}
-}
+    }
+    }
 }
