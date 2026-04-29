@@ -188,13 +188,17 @@ sys_co_yield(void)
    * proc, new process states, or new global kernel data structures.
    */
 
-  // Case 1: target is sleeping inside sleep(..., &wait_lock).
-  if(target->state == SLEEPING && target->chan == co_sleep_chan(target->pid)){
+  int is_sleeping_sleep = (target->state == SLEEPING && target->chan == co_sleep_chan(target->pid));
+  int is_sleeping_direct = (target->state == SLEEPING && target->chan == co_direct_chan(target->pid));
+
+  if(is_sleeping_sleep || is_sleeping_direct){
     acquire(&target->lock);
 
     // Re-check under target->lock.
-    if(target->killed || target->state != SLEEPING ||
-       target->chan != co_sleep_chan(target->pid)){
+    is_sleeping_sleep = (target->state == SLEEPING && target->chan == co_sleep_chan(target->pid));
+    is_sleeping_direct = (target->state == SLEEPING && target->chan == co_direct_chan(target->pid));
+
+    if(target->killed || !(is_sleeping_sleep || is_sleeping_direct)){
       release(&target->lock);
       release(&wait_lock);
       return -1;
@@ -206,55 +210,16 @@ sys_co_yield(void)
 
     // Deliver the value that becomes target's co_yield() return value.
     target->trapframe->a0 = value;
+    
     target->state = RUNNING;
 
-    // Important:
-    // wait_lock must not be held across the direct switch.
+    // Important: wait_lock must not be held across the direct switch.
     release(&wait_lock);
 
     // target->lock remains held across the switch on purpose.
-    // The target will resume inside sleep(), and sleep() will release it.
     co_handoff(p, target);
 
     // We resume here when another process later yields back to us.
-    // In that future handoff, our own lock is held across the switch.
-    co_resume_cleanup(p);
-
-    if(p->killed)
-      return -1;
-
-    return p->trapframe->a0;
-  }
-  // Case 2: target is suspended after a previous direct handoff.
-  if(target->state == SLEEPING && target->chan == co_direct_chan(target->pid)){
-    acquire(&target->lock);
-
-    // Re-check under target->lock.
-    if(target->killed || target->state != SLEEPING ||
-       target->chan != co_direct_chan(target->pid)){
-      release(&target->lock);
-      release(&wait_lock);
-      return -1;
-    }
-
-    // Current process will wait for the opposite yield in direct-wait mode.
-    p->chan = co_direct_chan(p->pid);
-    p->state = SLEEPING;
-
-    // Deliver the value that becomes target's co_yield() return value.
-    target->trapframe->a0 = value;
-    target->state = RUNNING;
-
-    // wait_lock must not be held across the direct switch.
-    release(&wait_lock);
-
-    // target->lock remains held across the switch here too.
-    // In this case the target resumes after co_handoff(), so it will
-    // release its own lock explicitly in sys_co_yield.
-    co_handoff(p, target);
-
-    // We resume here when another process later yields back to us.
-    // Our own lock is held across that direct switch and must be released.
     co_resume_cleanup(p);
 
     if(p->killed)
@@ -264,6 +229,7 @@ sys_co_yield(void)
   }
 
   // Fallback: target is not ready yet.
+  // The assignment explicitly says: "If the target is not yet prepared, the yielding process should sleep until the target process is prepared"
   sleep(co_sleep_chan(p->pid), &wait_lock);
   release(&wait_lock);
 
